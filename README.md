@@ -57,6 +57,10 @@ cmake --build build/host -j
 ./build/host/chassis_host --serial /dev/ttyUSB0 --listen 0.0.0.0:9000
 ```
 
+编辑器索引（clangd）：构建后 `build/host/compile_commands.json` 即编译数据库，
+根目录 `.clangd` 已指向它并豁免 `-Werror`（构建仍零告警强制）；编辑器安装
+clangd 扩展、系统安装 clangd 后即可跳转/补全。
+
 一键自测（构建 + 全部测试，详见 [docs/testing.md](docs/testing.md)）：
 
 ```bash

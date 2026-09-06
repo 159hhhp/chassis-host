@@ -2,6 +2,9 @@
 cmake_minimum_required(VERSION 3.13)
 project(chassis-host C CXX)
 
+# 导出 compile_commands.json 到构建目录（clangd 索引用，见根目录 .clangd）
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

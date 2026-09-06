@@ -1,0 +1,6 @@
+# clangd 项目配置：编译数据库取自 build/host（由
+# CMAKE_EXPORT_COMPILE_COMMANDS 导出），编辑器诊断把 -Werror 豁免为
+# 普通告警（构建期仍按 -Werror 强制零告警）。
+CompileFlags:
+  CompilationDatabase: build/host
+  Remove: [-Werror]
