@@ -6,9 +6,8 @@
 #   bash scripts/build_muduo.sh [muduo 源码目录]
 #
 # 源码目录按优先级解析：位置参数 > 环境变量 MUDUO_SRC > 自动查找
-#   ../muduo        与本仓库并列 git clone 的 muduo（推荐布局）
 #   ./muduo         克隆到仓库内（不推荐，会污染 git status）
-#   ../ref/muduo    本工作区开发布局
+#   ../muduo        与本仓库并列 git clone 的 muduo（推荐布局）
 # 独立使用请先获取源码:
 #   git clone https://github.com/chenshuo/muduo   （或其 Gitee 镜像）
 #
@@ -25,7 +24,7 @@
 #         build/muduo-src 剔除 -Werror 后重试（生成的副本属构建产物）。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS_ROOT="$(cd "$ROOT/.." && pwd)"
 BUILD_DIR="${MUDUO_BUILD_DIR:-$ROOT/build/muduo-build}"
 INSTALL_DIR="${MUDUO_INSTALL_DIR:-$ROOT/build/muduo-install}"
@@ -41,7 +40,7 @@ if [ -z "$MUDUO_SRC" ]; then
 fi
 
 if [ -z "$MUDUO_SRC" ]; then
-  echo "错误: 未找到 muduo 源码，已尝试: ../muduo ./muduo ../ref/muduo" >&2
+  echo "错误: 未找到 muduo 源码，已尝试: ./muduo ../muduo" >&2
   echo "      请先 git clone https://github.com/chenshuo/muduo（或其 Gitee 镜像），" >&2
   echo "      与本仓库并列放置；或把源码目录作为参数 / 环境变量 MUDUO_SRC 传入" >&2
   exit 1
