@@ -1,0 +1,2 @@
+# 换行统一由 git 管理：仓库内 LF，Windows 工作区按配置检出
+* text=auto

@@ -1,0 +1,8 @@
+# 构建产物（muduo-install / host / muduo-build / muduo-src 等）
+build/
+
+# 运行日志（--log-dir 默认写入 log/ 目录；log/ 源码本身保留）
+log/*.log
+
+# 外部库
+muduo
