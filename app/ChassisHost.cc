@@ -1,5 +1,6 @@
 #include "ChassisHost.h"
 
+#include <cctype>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -7,6 +8,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "log/Logger.h"
 
@@ -16,6 +20,14 @@ namespace app {
 namespace {
 
 constexpr size_t kMaxLineLen = 512;  ///< TCP 单行上限（超长直接丢弃防滥用）
+
+bool isSafeFirmwareName(const std::string& name) {
+  if (name.size() < 5 || name.compare(name.size() - 4, 4, ".hex") != 0) return false;
+  for (unsigned char c : name) {
+    if (!std::isalnum(c) && c != '.' && c != '_' && c != '-') return false;
+  }
+  return name.find("..") == std::string::npos;
+}
 
 /// 监听地址 "ip:port" 拆分（muduo InetAddress 需要分开传入）
 bool splitListenAddr(const std::string& addr, std::string* ip, uint16_t* port) {
@@ -146,6 +158,11 @@ void ChassisHost::onConnection(const muduo::net::TcpConnectionPtr& conn) {
       sendFrameToBoard(proto::PT_CMD_STOP, {});
     }
     if (pingConn_ == conn) pingConn_.reset();
+    if (otaConn_ == conn) {
+      // 升级发起端掉线不中止任务（擦写已开始就让它烧完），进度转日志
+      otaConn_.reset();
+      if (otaBusy()) LOG_WARN << "OTA 发起端已断开，任务继续（进度见日志）";
+    }
   }
 }
 
@@ -184,7 +201,18 @@ void ChassisHost::handleLine(const muduo::net::TcpConnectionPtr& conn, std::stri
 
 void ChassisHost::handleCommand(const muduo::net::TcpConnectionPtr& conn,
                                 const std::vector<std::string>& tok) {
+  if (tok.empty()) return;
   const std::string& cmd = tok[0];
+
+  // 升级忙态门控：烧录期间只放行查询/取消类命令（stop 也放行，无害）
+  if (otaBusy() && cmd != "flash_status" && cmd != "flash_abort" && cmd != "stat" &&
+      cmd != "con" && cmd != "help" && cmd != "quit" && cmd != "exit" &&
+      cmd != "watch" && cmd != "stop") {
+    conn->send(std::string("err busy: 固件升级进行中（") + otaStateName() +
+               "），flash_status 查看 / flash_abort 取消\n");
+    return;
+  }
+
   if (cmd == "v") {
     cmdTwist(conn, tok);
   } else if (cmd == "rpm") {
@@ -205,6 +233,12 @@ void ChassisHost::handleCommand(const muduo::net::TcpConnectionPtr& conn,
     cmdStat(conn);
   } else if (cmd == "con") {
     cmdCon(conn);
+  } else if (cmd == "flash") {
+    cmdFlash(conn, tok);
+  } else if (cmd == "flash_status") {
+    cmdFlashStatus(conn);
+  } else if (cmd == "flash_abort") {
+    cmdFlashAbort(conn, tok);
   } else if (cmd == "help") {
     cmdHelp(conn);
   } else if (cmd == "quit" || cmd == "exit") {
@@ -377,10 +411,11 @@ std::string ChassisHost::statSummary() const {
           jnum(rpm_[2], "%.1f") + ")";
   }
   std::string s;
-  appendf(&s, "serial=%s con=%s/%s cmd=%s tx=%llu frames=%llu crc=%llu drop=%llu uptime=%.1fs",
+  appendf(&s, "serial=%s con=%s/%s cmd=%s ota=%s tx=%llu frames=%llu crc=%llu drop=%llu uptime=%.1fs",
           serial_.isOpen() ? "up" : "down",
           link::ConSm::stateName(conSm_.state()), link::ConSm::commName(conSm_.comm()),
-          cmd.c_str(), static_cast<unsigned long long>(txFrames_),
+          cmd.c_str(), otaStateName(),
+          static_cast<unsigned long long>(txFrames_),
           static_cast<unsigned long long>(st.frames),
           static_cast<unsigned long long>(st.crcErr),
           static_cast<unsigned long long>(st.drop),
@@ -418,7 +453,218 @@ void ChassisHost::cmdHelp(const muduo::net::TcpConnectionPtr& conn) {
       "  sign <s1> <s2> <s3> 编码器方向校正 ±1（CMD_SIGN）\n"
       "  ping                测板端 RTT\n"
       "  watch [on|off]      订阅/退订 JSON 遥测流\n"
+      "  flash <name.hex>    远程固件烧录（仅本机连接；文件须在固件目录内\n"
+      "                      且配对 .manifest.json；完成后保持失能）\n"
+      "  flash_status        烧录状态/进度\n"
+      "  flash_abort [force] 取消烧录（擦写中需 force：杀进程组，板留在 BL）\n"
       "  stat | con | quit   统计 / CON 状态 / 断开\n");
+}
+
+// ================= OTA 远程烧录 =================
+
+const char* ChassisHost::otaStateName() const {
+  switch (otaState_) {
+    case OtaState::kNone: return "none";
+    case OtaState::kQuiescing: return "quiescing";
+    case OtaState::kFlashing: return "flashing";
+    case OtaState::kRecovering: return "recovering";
+  }
+  return "?";
+}
+
+bool ChassisHost::isLoopbackConn(const muduo::net::TcpConnectionPtr& conn) {
+  const std::string ip = conn->peerAddress().toIp();
+  return ip == "127.0.0.1" || ip == "::1";
+}
+
+void ChassisHost::cmdFlash(const muduo::net::TcpConnectionPtr& conn,
+                           const std::vector<std::string>& tok) {
+  if (tok.size() != 2) {
+    conn->send("err 用法: flash <文件名.hex>（仅文件名，文件位于固件目录）\n");
+    return;
+  }
+  if (!isLoopbackConn(conn)) {
+    conn->send("err flash 仅接受本机回环连接（SSH 到车端后 nc 127.0.0.1 "
+               "9000）\n");
+    return;
+  }
+  if (otaBusy()) {
+    conn->send(std::string("err flash: 已有任务进行中（") + otaStateName() +
+               "），flash_status 查看\n");
+    return;
+  }
+  if (opts_.flashDev.empty() || opts_.flashScript.empty()) {
+    conn->send("err flash: 未配置烧录链路（启动参数 --flash-dev / "
+               "--flash-script，见 docs/protocol-tcp.md）\n");
+    return;
+  }
+  const std::string& name = tok[1];
+  if (!isSafeFirmwareName(name)) {
+    conn->send("err flash: 文件名非法（仅收固件目录内的 .hex 文件名）\n");
+    return;
+  }
+  std::string path = opts_.firmwareDir + "/" + name;
+  if (::access(path.c_str(), R_OK) != 0) {
+    conn->send("err flash: 文件不存在 " + path + "\n");
+    return;
+  }
+
+  // 进入 QUIESCING：清速度重发 → 粘性失能 → STOP/EN0，等板端 STATUS 确认
+  otaFile_ = name;
+  otaConn_ = conn;
+  otaStage_ = "-";
+  otaLastLine_.clear();
+  otaCliLineCount_ = 0;
+  otaState_ = OtaState::kQuiescing;
+  otaPhaseStartMs_ = steadyMs();
+  cmdMode_ = CmdMode::kNone;
+  speedConn_.reset();
+  userDisabled_ = true;  // 升级全程+完成后保持失能，人工 en 1 才恢复
+  sendFrameToBoard(proto::PT_CMD_STOP, {});
+  sendFrameToBoard(proto::PT_CMD_EN, proto::packCmdEn(false));
+  conn->send("ok flash: 停车确认中（等 STATUS en=0，超时 " +
+             std::to_string(opts_.quiesceTimeoutMs) + "ms）\n");
+  broadcastAll("{\"t\":\"ota\",\"state\":\"quiescing\",\"file\":\"" + name + "\"}");
+  LOG_INFO << "OTA 开始: " << name << "（QUIESCING）";
+}
+
+void ChassisHost::otaBeginFlasher() {
+  otaState_ = OtaState::kFlashing;
+  otaPhaseStartMs_ = steadyMs();
+  // 板子即将复位进 bootloader：强制清 CON 现场（优雅 disconnect 会因无应答
+  // 空转 2s），此后 kFlashing 期间看门狗暂停重连与静默告警
+  conSm_.reset();
+
+  if (!flasher_) flasher_ = std::make_unique<ota::OtaFlasher>(loop_);
+  std::vector<std::string> argv = {
+      opts_.flashPython, "-u", opts_.flashScript,
+      "--flash", opts_.flashDev, opts_.firmwareDir + "/" + otaFile_,
+      "--tool", opts_.flashTool};
+  if (!flasher_->start(
+          argv,
+          [this](const std::string& line) { otaOnChildLine(line); },
+          [this](bool ok, int status) { otaOnChildExit(ok, status); })) {
+    otaFinish("err flash: 子进程启动失败（检查 --flash-script / 解释器）");
+    return;
+  }
+  otaSendProgress("ok flash: 烧录子进程已启动（" + otaFile_ + "）");
+  broadcastAll("{\"t\":\"ota\",\"state\":\"flashing\"}");
+}
+
+void ChassisHost::otaOnChildLine(const std::string& line) {
+  otaLastLine_ = line;
+  if (line.rfind("STAGE: ", 0) == 0) {
+    otaStage_ = line.substr(7);
+    otaCliLineCount_ = 0;
+    otaSendProgress("flash [" + otaStage_ + "]");
+    return;
+  }
+  if (line.rfind("OK: ", 0) == 0) {
+    otaSendProgress("flash ok: " + line.substr(4));
+    return;
+  }
+  if (line.rfind("FAIL: ", 0) == 0) {
+    otaSendProgress("flash fail: " + line.substr(6));
+    return;
+  }
+  if (line.rfind("cli| ", 0) == 0) {
+    // 后端原始输出透传；stm32flash 逐块进度行很密，20 行放行 1 行
+    if (line.find("Wrote and verified address") != std::string::npos ||
+        line.find('%') != std::string::npos) {
+      if (++otaCliLineCount_ % 20 != 0) return;
+    }
+  }
+  otaSendProgress("  " + line);
+}
+
+void ChassisHost::otaOnChildExit(bool ok, int exitStatus) {
+  if (otaState_ != OtaState::kFlashing) return;  // abort 已收尾
+  if (ok) {
+    otaSendProgress("ok flash: 擦写校验通过，复位运行中，等待 CON 重建…");
+    otaState_ = OtaState::kRecovering;
+    otaPhaseStartMs_ = steadyMs();
+    lastRetryMs_ = 0;  // 让看门狗下一拍立即发起 CON 重连
+    broadcastAll("{\"t\":\"ota\",\"state\":\"recovering\"}");
+    return;
+  }
+  std::string reason = "status=" + std::to_string(exitStatus);
+  if (WIFEXITED(exitStatus)) {
+    reason = "exit=" + std::to_string(WEXITSTATUS(exitStatus));
+  } else if (WIFSIGNALED(exitStatus)) {
+    reason = "signal=" + std::to_string(WTERMSIG(exitStatus));
+  }
+  if (WIFEXITED(exitStatus) && WEXITSTATUS(exitStatus) == 6) {
+    otaFinish("err flash: 烧录口被占用或不存在（" + reason +
+              "），未进入 bootloader；电机保持失能。" +
+              (otaLastLine_.empty() ? "" : "最后输出: " + otaLastLine_));
+  } else if (otaStage_ == "check") {
+    otaFinish("err flash: 镜像预检失败（" + reason +
+              "），未进入 bootloader；电机保持失能。" +
+              (otaLastLine_.empty() ? "" : "最后输出: " + otaLastLine_));
+  } else {
+    otaFinish("err flash: 烧录失败（" + reason +
+              "）。板子可能停在 bootloader，可直接重试 flash。" +
+              (otaLastLine_.empty() ? "" : "最后输出: " + otaLastLine_));
+  }
+}
+
+void ChassisHost::otaFinish(const std::string& resultLine) {
+  otaSendProgress(resultLine);
+  broadcastAll("{\"t\":\"ota\",\"state\":\"done\"}");
+  LOG_INFO << "OTA 结束（" << resultLine << "）";
+  otaState_ = OtaState::kNone;
+  otaConn_.reset();
+  otaStage_ = "-";
+  otaLastLine_.clear();
+  // userDisabled_ 有意保持 true：升级后不自动使能、不恢复旧速度（安全约定）
+}
+
+void ChassisHost::otaSendProgress(const std::string& line) {
+  if (otaConn_ && otaConn_->connected()) {
+    otaConn_->send(line + "\n");
+  } else {
+    LOG_INFO << "OTA（发起端已断开）: " << line;
+  }
+}
+
+void ChassisHost::cmdFlashStatus(const muduo::net::TcpConnectionPtr& conn) {
+  std::string s = "ok flash_status state=";
+  s += otaStateName();
+  if (otaBusy()) {
+    appendf(&s, " file=%s stage=%s child=%s",
+            otaFile_.c_str(), otaStage_.c_str(),
+            (flasher_ && flasher_->running()) ? "alive" : "none");
+  }
+  s += "\n";
+  conn->send(s);
+}
+
+void ChassisHost::cmdFlashAbort(const muduo::net::TcpConnectionPtr& conn,
+                                const std::vector<std::string>& tok) {
+  if (!isLoopbackConn(conn)) {
+    conn->send("err flash_abort 仅接受本机回环连接\n");
+    return;
+  }
+  if (tok.size() > 2 || (tok.size() == 2 && tok[1] != "force")) {
+    conn->send("err 用法: flash_abort [force]\n");
+    return;
+  }
+  if (otaState_ == OtaState::kNone) {
+    conn->send("err flash_abort: 无进行中的烧录任务\n");
+  } else if (otaState_ == OtaState::kQuiescing) {
+    otaFinish("ok flash_abort: 擦除尚未开始，已取消；电机保持失能");
+  } else if (otaState_ == OtaState::kFlashing) {
+    if (tok.size() == 2 && tok[1] == "force") {
+      conn->send("ok flash_abort force: 已向进程组发 TERM（0.5s 后 KILL），"
+                 "退出后自动收尾；板子留在 bootloader，可重试 flash\n");
+      flasher_->killGroup();  // 子进程退出经 otaOnChildExit(ok=false) 走失败收尾
+    } else {
+      conn->send("err flash_abort: 擦写进行中，中止会留下半份固件"
+                 "（bootloader 无恙，重烧可恢复）。确认请用: flash_abort force\n");
+    }
+  } else {  // kRecovering
+    otaFinish("ok flash_abort: 已退出恢复等待，CON 由看门狗继续自动重建");
+  }
 }
 
 // ================= 串口/协议侧 =================
@@ -465,6 +711,11 @@ void ChassisHost::onFrame(const proto::Frame& f) {
         LOG_WARN << "观测到 en=0（板侧重上电？），补发 CMD_EN";
         lastEnSentMs_ = now;
         sendFrameToBoard(proto::PT_CMD_EN, proto::packCmdEn(true));
+      }
+      // OTA QUIESCING：板端亲口确认已失能 → 启动烧录子进程
+      if (otaState_ == OtaState::kQuiescing && status_.en == 0) {
+        LOG_INFO << "OTA: 板端已确认 en=0（停车确认完成）";
+        otaBeginFlasher();
       }
       break;
     }
@@ -524,6 +775,10 @@ void ChassisHost::onCommState(link::ConSm::CommState comm) {
       lastEnSentMs_ = steadyMs();
       sendFrameToBoard(proto::PT_CMD_EN, proto::packCmdEn(true));
     }
+    if (otaState_ == OtaState::kRecovering) {
+      // 烧录后固件回归、CON 重建成功：升级闭环（电机保持失能）
+      otaFinish("ok flash complete: CON 已重建，电机保持失能（en 1 人工恢复）");
+    }
   }
 }
 
@@ -582,8 +837,22 @@ void ChassisHost::onWatchdogTimer() {
     serial_.openDevice(opts_.serialDev, opts_.serialBaud);  // 幂等，失败仅 DEBUG
   }
 
-  // 1) 板帧静默：串口开着却长时间收不到任何帧（板子死机/线缆半插）
-  if (serial_.isOpen() && lastFrameMs_ != 0 && now - lastFrameMs_ > opts_.rxTimeoutMs) {
+  // 0.5) OTA 阶段超时驱动
+  if (otaState_ == OtaState::kQuiescing && now - otaPhaseStartMs_ > opts_.quiesceTimeoutMs) {
+    // 未确认停车（应用离线/串口断）：复位进 BL 本身就是硬停车兜底，
+    // 且"应用跑飞"时恰恰需要这条不在线也允许烧的恢复路径
+    LOG_WARN << "OTA: 停车确认超时（应用离线？），复位进 BL 兜底，继续烧录";
+    otaBeginFlasher();
+  } else if (otaState_ == OtaState::kRecovering &&
+             now - otaPhaseStartMs_ > opts_.recoverTimeoutMs) {
+    otaFinish("err flash: CON 重建超时（固件未起来？）。升级状态复位，"
+              "看门狗会继续自动重连；必要时重试 flash");
+  }
+
+  // 1) 板帧静默：串口开着却长时间收不到任何帧（板子死机/线缆半插）。
+  //    升级期间板子在 bootloader/复位中，静默是预期，不告警
+  if (otaState_ == OtaState::kNone && serial_.isOpen() && lastFrameMs_ != 0 &&
+      now - lastFrameMs_ > opts_.rxTimeoutMs) {
     if (!rxSilenceWarned_) {
       rxSilenceWarned_ = true;
       LOG_WARN << "板帧静默超 " << opts_.rxTimeoutMs << "ms（CON ping 无应答将自动断链）";
@@ -591,8 +860,10 @@ void ChassisHost::onWatchdogTimer() {
     }
   }
 
-  // 2) CON 自动重连（节流）：DISCONNECTED 且串口可用 → 再次建链
-  if (serial_.isOpen() && conSm_.state() == link::ConSm::ST_DISCONNECTED &&
+  // 2) CON 自动重连（节流）：DISCONNECTED 且串口可用 → 再次建链。
+  //    kFlashing 期间板子在 bootloader（USART3 无应答），重连只产生噪音
+  if (otaState_ != OtaState::kFlashing && serial_.isOpen() &&
+      conSm_.state() == link::ConSm::ST_DISCONNECTED &&
       now - lastRetryMs_ >= opts_.conRetryMs) {
     lastRetryMs_ = now;
     LOG_DEBUG << "CON 重连尝试";

@@ -49,6 +49,10 @@ class ConSm {
   int connect(uint64_t nowMs);
   /// 请求拆链（发 DISABLE_REQUEST 并等确认）。0=已受理或本就断开；-1=忙
   int disconnect(uint64_t nowMs);
+  /// 强制回 DISCONNECTED：清空在途握手/保活，不发任何帧（区别于优雅
+  /// disconnect）。用于 OTA 烧录等"对端即将复位消失"的场景；通信态若
+  /// 原为 READY 会补一次 NOT_READY 边沿回调。
+  void reset();
   /// 喂入一帧 CON 消息（调用方先经 proto::unpackCon 校验）
   void onFrame(proto::ConMsgType msgType, uint64_t nowMs);
   /// 周期驱动 deadline（建议 50~100ms 一拍）

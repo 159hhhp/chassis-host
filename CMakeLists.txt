@@ -61,12 +61,17 @@ add_library(mhost_serial STATIC
     serial/SerialPort.cc)
 target_link_libraries(mhost_serial PUBLIC mhost_log ${MUDUO_LIBS} Threads::Threads)
 
+# ---- OTA 烧录子进程（posix_spawnp 独立进程组 + pipe 挂 epoll） ----
+add_library(mhost_ota STATIC
+    ota/OtaFlasher.cc)
+target_link_libraries(mhost_ota PUBLIC mhost_log ${MUDUO_LIBS} Threads::Threads)
+
 # ---- 主程序 ----
 add_executable(chassis_host
     app/ChassisHost.cc
     app/main.cc)
 target_link_libraries(chassis_host
-    mhost_serial mhost_link mhost_proto mhost_log
+    mhost_serial mhost_link mhost_proto mhost_log mhost_ota
     ${MUDUO_LIBS} Threads::Threads)
 
 # ---- 单元测试与性能基准 ----
@@ -78,6 +83,10 @@ add_test(NAME framecodec COMMAND test_framecodec)
 add_executable(test_consm tests/test_consm.cc)
 target_link_libraries(test_consm mhost_link mhost_proto)
 add_test(NAME consm COMMAND test_consm)
+
+add_executable(test_otaflasher tests/test_otaflasher.cc)
+target_link_libraries(test_otaflasher mhost_ota)
+add_test(NAME otaflasher COMMAND test_otaflasher)
 
 add_executable(log_bench tests/log_bench.cc)
 target_link_libraries(log_bench mhost_log Threads::Threads)

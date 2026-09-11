@@ -37,6 +37,18 @@ int ConSm::disconnect(uint64_t nowMs) {
   return -1;  // CONNECTING / DISCONNECTING：忙
 }
 
+void ConSm::reset() {
+  state_ = ST_DISCONNECTED;
+  rspDeadline_ = 0;
+  pingDeadline_ = 0;
+  pingRep_ = 0;
+  reqRep_ = 0;
+  if (comm_ != COMM_NOT_READY) {
+    comm_ = COMM_NOT_READY;
+    if (commCb_) commCb_(COMM_NOT_READY);
+  }
+}
+
 void ConSm::onFrame(proto::ConMsgType msgType, uint64_t nowMs) {
   switch (msgType) {
     case proto::CON_ENABLE_REQUEST:

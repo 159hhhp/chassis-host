@@ -13,6 +13,7 @@ cmake --build "$BUILD_DIR" -j"$(nproc)"
 echo "== 单元测试 =="
 "$BUILD_DIR/test_framecodec"
 "$BUILD_DIR/test_consm"
+"$BUILD_DIR/test_otaflasher"
 
 echo "== 日志基准（4 线程 x 50000 行）=="
 "$BUILD_DIR/log_bench" 4 50000

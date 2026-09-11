@@ -18,6 +18,7 @@
 #include <muduo/net/TcpServer.h>
 
 #include "link/ConSm.h"
+#include "ota/OtaFlasher.h"
 #include "proto/FrameCodec.h"
 #include "serial/SerialPort.h"
 
@@ -27,13 +28,22 @@ namespace app {
 struct HostOptions {
   std::string serialDev = "/dev/ttyUSB0";  ///< 串口设备（树莓派 USB3 口 CH9102）
   int serialBaud = 115200;                 ///< 与固件 USART3 一致（8N1）
-  std::string listenAddr = "0.0.0.0:9000"; ///< TCP 监听地址
+  std::string listenAddr = "127.0.0.1:9000"; ///< TCP 监听（默认仅本机；开放
+                                           ///  局域网须显式 --listen 0.0.0.0:9000）
   double repeatHz = 10.0;                  ///< 速度指令重发节拍（喂板侧 500ms 超时）
   double odomHz = 10.0;                    ///< odom JSON 推送频率（watch 订阅者）
   double slowHz = 1.0;                     ///< enc/imu/telem/status JSON 推送频率
   uint64_t conRetryMs = 2000;              ///< CON 断链后自动重连节流
   uint64_t rxTimeoutMs = 2000;             ///< 板帧静默告警阈值
   uint64_t enResendMs = 1000;              ///< STATUS en=0 补发 CMD_EN 的限频
+  // ---- OTA 远程烧录（USB1 口 + 出厂 bootloader，见 docs/protocol-tcp.md）----
+  std::string flashDev;                    ///< USB1 烧录口设备（空 = 禁用 flash）
+  std::string firmwareDir = "firmware";    ///< 固件白名单目录（flash 只收其中文件名）
+  std::string flashScript;                 ///< flash.py 绝对路径（C30D_Chassis/host_test）
+  std::string flashPython = "python3";     ///< 解释器（-u 逐行输出）
+  std::string flashTool = "auto";          ///< 透传 flash.py --tool（cubeprog/stm32flash）
+  uint64_t quiesceTimeoutMs = 3000;        ///< QUIESCING 等 STATUS en=0 上限
+  uint64_t recoverTimeoutMs = 15000;       ///< 烧录后等 CON 重建上限
 };
 
 class ChassisHost {
@@ -64,6 +74,21 @@ class ChassisHost {
   void cmdStat(const muduo::net::TcpConnectionPtr& conn);
   void cmdCon(const muduo::net::TcpConnectionPtr& conn);
   void cmdHelp(const muduo::net::TcpConnectionPtr& conn);
+
+  // ---- OTA 远程烧录命令与状态机（流程见 docs/protocol-tcp.md）----
+  void cmdFlash(const muduo::net::TcpConnectionPtr& conn,
+                const std::vector<std::string>& tok);
+  void cmdFlashAbort(const muduo::net::TcpConnectionPtr& conn,
+                     const std::vector<std::string>& tok);
+  void cmdFlashStatus(const muduo::net::TcpConnectionPtr& conn);
+  void otaBeginFlasher();                       ///< QUIESCING 完成/超时 → 启动子进程
+  void otaOnChildLine(const std::string& line); ///< flash.py 输出解析与转发
+  void otaOnChildExit(bool ok, int exitStatus);
+  void otaFinish(const std::string& resultLine); ///< 统一收尾（回 IDLE，保持失能）
+  void otaSendProgress(const std::string& line); ///< 进度发发起者（已断则落日志）
+  const char* otaStateName() const;
+  bool otaBusy() const { return otaState_ != OtaState::kNone; }
+  static bool isLoopbackConn(const muduo::net::TcpConnectionPtr& conn);
 
   // ---- 串口/协议侧 ----
   void onSerialData(const char* data, size_t len);
@@ -127,6 +152,21 @@ class ChassisHost {
   uint64_t lastRetryMs_ = 0;       ///< 最近一次 CON 重连尝试
   uint64_t lastEnSentMs_ = 0;      ///< 最近一次 CMD_EN 发送（补发限频）
   bool userDisabled_ = false;      ///< 用户手动失能（粘性：压制 READY 自愈补发）
+
+  // ---- OTA 远程烧录状态机 ----
+  // 流程：kQuiescing（停速度重发+STOP/EN0，等 STATUS en=0 确认，超时兜底
+  // 继续进 BL——复位本身就是硬停车）→ kFlashing（ConSm 强制 reset，子进程
+  // 烧录，此阶段抑制 rx 静默告警与 CON 重连）→ kRecovering（等 CON 重建）
+  // → kNone（保持失能，人工 en 1 才恢复运动）。
+  enum class OtaState : uint8_t { kNone, kQuiescing, kFlashing, kRecovering };
+  OtaState otaState_ = OtaState::kNone;
+  muduo::net::TcpConnectionPtr otaConn_;  ///< 发起者（断开不中止任务，仅停止回显）
+  std::string otaFile_;                   ///< 本次烧录文件名（白名单内 basename）
+  std::string otaStage_;                  ///< flash.py 最近 STAGE
+  std::string otaLastLine_;               ///< 最近一行子进程输出（诊断）
+  uint64_t otaPhaseStartMs_ = 0;          ///< 当前阶段起始（超时基准）
+  int otaCliLineCount_ = 0;               ///< cli| 进度透传限频计数
+  std::unique_ptr<ota::OtaFlasher> flasher_;
 
   // ---- 统计 ----
   uint64_t txFrames_ = 0;

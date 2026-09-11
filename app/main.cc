@@ -38,7 +38,8 @@ void usage(const char* prog) {
       "用法: %s [选项]\n"
       "  --serial <dev>       串口设备（默认 /dev/ttyUSB0，树莓派 USB3 口 CH9102）\n"
       "  --baud <n>           波特率（默认 115200，8N1，与固件 USART3 一致）\n"
-      "  --listen <ip:port>   TCP 监听（默认 0.0.0.0:9000）\n"
+      "  --listen <ip:port>   TCP 监听（默认 127.0.0.1:9000 仅本机；开放局域网\n"
+      "                       须显式 --listen 0.0.0.0:9000，建议 SSH 隧道使用）\n"
       "  --log-dir <dir>      日志目录（默认 log；传 \"\" 用 stdout 同步输出）\n"
       "  --log-level <lv>     trace/debug/info/warn/error/fatal（默认 info）\n"
       "  --repeat-hz <hz>     速度指令重发频率（默认 10，喂板侧 500ms 超时）\n"
@@ -47,6 +48,12 @@ void usage(const char* prog) {
       "  --con-retry-ms <ms>  CON 断链重连节流（默认 2000）\n"
       "  --rx-timeout-ms <ms> 板帧静默告警阈值（默认 2000）\n"
       "  --en-resend-ms <ms>  STATUS en=0 补发 CMD_EN 限频（默认 1000）\n"
+      "  --flash-dev <dev>    USB1 烧录口设备（如 /dev/c30d-flash；不配则禁用\n"
+      "                       flash 命令。与固件烧录工具配套，见 docs/protocol-tcp.md）\n"
+      "  --flash-script <p>   flash.py 路径（C30D_Chassis/host_test/flash.py）\n"
+      "  --firmware-dir <dir> flash 命令固件白名单目录（默认 firmware）\n"
+      "  --flash-tool <t>     透传 flash.py --tool（auto/cubeprog/stm32flash）\n"
+      "  --flash-python <exe> 烧录脚本解释器（默认 python3）\n"
       "  -h, --help           本说明\n",
       prog);
 }
@@ -71,11 +78,17 @@ int main(int argc, char* argv[]) {
       {"con-retry-ms", required_argument, nullptr, 'c'},
       {"rx-timeout-ms", required_argument, nullptr, 'x'},
       {"en-resend-ms", required_argument, nullptr, 'e'},
+      {"flash-dev", required_argument, nullptr, 'f'},
+      {"flash-script", required_argument, nullptr, 'S'},
+      {"firmware-dir", required_argument, nullptr, 'm'},
+      {"flash-tool", required_argument, nullptr, 'T'},
+      {"flash-python", required_argument, nullptr, 'P'},
       {"help", no_argument, nullptr, 'h'},
       {nullptr, 0, nullptr, 0},
   };
   int ch;
-  while ((ch = ::getopt_long(argc, argv, "s:b:l:d:v:r:o:w:c:x:e:h", longopts, nullptr)) != -1) {
+  while ((ch = ::getopt_long(argc, argv, "s:b:l:d:v:r:o:w:c:x:e:f:S:m:T:P:h",
+                             longopts, nullptr)) != -1) {
     switch (ch) {
       case 's': opts.serialDev = optarg; break;
       case 'b': opts.serialBaud = ::atoi(optarg); break;
@@ -88,6 +101,11 @@ int main(int argc, char* argv[]) {
       case 'c': opts.conRetryMs = static_cast<uint64_t>(::atoll(optarg)); break;
       case 'x': opts.rxTimeoutMs = static_cast<uint64_t>(::atoll(optarg)); break;
       case 'e': opts.enResendMs = static_cast<uint64_t>(::atoll(optarg)); break;
+      case 'f': opts.flashDev = optarg; break;
+      case 'S': opts.flashScript = optarg; break;
+      case 'm': opts.firmwareDir = optarg; break;
+      case 'T': opts.flashTool = optarg; break;
+      case 'P': opts.flashPython = optarg; break;
       case 'h': usage(argv[0]); return 0;
       default: usage(argv[0]); return 1;
     }
